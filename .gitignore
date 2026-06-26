@@ -4,3 +4,5 @@ __pycache__/
 .DS_Store
 fast_kmeans_regressor.py
 reg_test.ipynb
+fast_kmeans.egg-info
+build

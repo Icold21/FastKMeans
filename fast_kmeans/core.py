@@ -166,10 +166,7 @@ class BaseFastKMeans(nn.Module):
         self._torch_dtype = dtype_map[self.dtype]
 
         self.register_buffer('centroids', torch.empty(0, dtype=self._torch_dtype, device=self._device))
-        
-        # 1D Global weights for EMA targets
         self.register_buffer('centroid_weights', torch.empty(0, dtype=torch.float32, device=self._device))
-        # 2D Feature-specific weights initialized dynamically ONLY if feature_mask is provided
         self.register_buffer('centroid_feature_weights', torch.empty(0, dtype=torch.float32, device=self._device))
         
         if feature_weights is not None:
@@ -179,7 +176,7 @@ class BaseFastKMeans(nn.Module):
         self.register_buffer('_fi_var_within', torch.empty(0, device=self._device))
 
         self.learning_rate_ = 1e-4 if distance == 'cosine' else 1e-3
-        self._lr_finder_state = {'iter': 0, 'best_loss': float('inf'), 'current_lr': 1e-7, 'losses': [], 'lrs':[]}
+        self._lr_finder_state = {'iter': 0, 'best_loss': float('inf'), 'current_lr': 1e-7, 'losses': [], 'lrs': []}
         
         self._is_initialized = False
         self.frozen_mask: Optional[torch.Tensor] = None
@@ -190,6 +187,36 @@ class BaseFastKMeans(nn.Module):
             self._cdist_compiled = torch.compile(self._compute_distances, mode="reduce-overhead")
         else:
             self._cdist_compiled = self._compute_distances
+
+    def _calculate_optimal_k(self, tensor_sub: torch.Tensor, is_target: bool = False) -> int:
+        """Analytically determines the optimal number of prototypes for a given sub-manifold 
+        using Geometric Information Dispersion.
+        """
+        N = tensor_sub.shape[0]
+        if N <= 1: 
+            return 1
+
+        with torch.no_grad():
+            mu = tensor_sub.mean(dim=0, keepdim=True)
+            dist_metric = getattr(self, 'target_distance', 'euclidean') if is_target else self.distance
+            
+            if dist_metric == 'cosine':
+                mu_norm = F.normalize(mu, p=2, dim=1)
+                t_norm = F.normalize(tensor_sub, p=2, dim=1)
+                sim = torch.mm(t_norm, mu_norm.t())
+            elif dist_metric == 'euclidean':
+                dist2 = torch.sum((tensor_sub - mu)**2, dim=1, keepdim=True)
+                sim = 1.0 / (1.0 + dist2)
+            else: # l1
+                dist = torch.abs(tensor_sub - mu).sum(dim=1, keepdim=True)
+                sim = 1.0 / (1.0 + dist)
+                
+            mean_sim = torch.clamp(sim, 0.0, 1.0).mean().item()
+            dispersion = 1.0 - mean_sim
+            
+            # Analytical bound: MDL upper limit (sqrt(N)) scaled by structural dispersion
+            k_opt = math.ceil(math.sqrt(N) * dispersion * 3.0)
+            return max(1, min(N, k_opt))
 
     def _enable_gradients(self) -> list:
         """Injects gradients into structural buffers and returns parameters for the optimizer."""
@@ -440,7 +467,8 @@ class BaseFastKMeans(nn.Module):
                 self._fi_var_within = 0.9 * self._fi_var_within + 0.1 * var_w
 
             weights = 1.0 - (self._fi_var_within / (self._fi_var_x + 1e-9))
-            self.feature_weights.data = torch.clamp(weights, min=0.0, max=1.0)
+            if hasattr(self, "feature_weights"):
+                self.feature_weights.data = torch.clamp(weights, min=0.0, max=1.0)
 
     def calculate_feature_importance(self, X: Any, sample_weight: Any = None, feature_mask: Any = None) -> None:
         """Calculates global algorithmic feature weights over the provided dataset."""
@@ -462,7 +490,7 @@ class BaseFastKMeans(nn.Module):
         if self.optimizer is None:
             params = self._enable_gradients()
             self.optimizer = optim.Adam(params, lr=min_lr)
-            self._lr_finder_state = {'iter': 0, 'best_loss': float('inf'), 'current_lr': min_lr, 'losses': [], 'lrs':[]}
+            self._lr_finder_state = {'iter': 0, 'best_loss': float('inf'), 'current_lr': min_lr, 'losses': [], 'lrs': []}
 
         st = self._lr_finder_state
         if st['iter'] >= steps: 
@@ -494,7 +522,8 @@ class BaseFastKMeans(nn.Module):
 
     def find_learning_rate(self, X: Any, y: Any = None, sample_weight: Any = None, feature_mask: Any = None) -> None:
         """Finds optimal Learning Rate automatically without corrupting grid topology."""
-        if getattr(self, "soft_type", None) in ['hard', 'mean']: return
+        if getattr(self, "soft_type", None) in ['hard', 'mean']: 
+            return
         
         logger.info("Automatic Learning Rate is calculating...")
         initial_state = copy.deepcopy(self.state_dict())
@@ -535,7 +564,11 @@ class BaseFastKMeans(nn.Module):
             
         if gradient_step:
             if getattr(self, "soft_type", None) in ['hard', 'mean']:
-                raise RuntimeError(f"Gradient optimization is IMPOSSIBLE with soft_type='{self.soft_type}'.")
+                raise RuntimeError(
+                    f"Gradient optimization is IMPOSSIBLE with soft_type='{self.soft_type}'.\n"
+                    "Reason: 'hard' and 'mean' mappings are non-differentiable.\n"
+                    "Solution: Switch to 'scaled' or 'softmax_scaled'."
+                )
 
             if getattr(self, "optimizer", None) is None: 
                 params = self._enable_gradients()
@@ -676,16 +709,17 @@ class BaseFastKMeans(nn.Module):
 class FastKMeansClusterer(BaseFastKMeans):
     """Pure Unsupervised Clustering with Feature Masking capabilities."""
 
-    def __init__(self, k_init: int = 10, **kwargs):
+    def __init__(self, k_init: Union[int, str] = 'auto', **kwargs):
         super().__init__(**kwargs)
-        self.k_init = k_init
+        if isinstance(k_init, str): _check_param('k_init', k_init.lower(), ['auto'])
+        self.k_init = k_init if isinstance(k_init, int) else k_init.lower()
         
     def _validate_targets(self, y: Any) -> Optional[torch.Tensor]:
         return None
 
     def _initialize(self, X: torch.Tensor, y: Optional[torch.Tensor]) -> None:
         n_samples = X.shape[0]
-        k = min(self.k_init, n_samples)
+        k = self._calculate_optimal_k(X, is_target=False) if self.k_init == 'auto' else min(self.k_init, n_samples)
         
         if self.init_mode == 'random':
             centers = X[torch.randperm(n_samples, device=self._device)[:k]]
@@ -729,21 +763,25 @@ class FastKMeansClusterer(BaseFastKMeans):
             X_batch_f32 = X_batch.to(torch.float32)
             
             if feature_mask is None:
-                ema_lr = W_update[valid] / self.centroid_weights[valid]
+                ema_lr_full = torch.zeros(K, dtype=torch.float32, device=self._device)
+                ema_lr_full[valid] = W_update[valid] / self.centroid_weights[valid]
+                
                 X_pull_sum = torch.zeros((K, X_batch.shape[1]), dtype=torch.float32, device=self._device).index_add_(0, pull_idx, X_batch_f32 * sw.unsqueeze(1))
-                ema_lr_exp = ema_lr.unsqueeze(1)
+                ema_lr_exp = ema_lr_full[valid].unsqueeze(1)
                 self.centroids[valid] = ((1 - ema_lr_exp) * self.centroids[valid].to(torch.float32) + ema_lr_exp * (X_pull_sum[valid] / W_update[valid].unsqueeze(1))).to(self._torch_dtype)
             else:
                 if getattr(self, "centroid_feature_weights", None) is None or self.centroid_feature_weights.numel() == 0:
-                    self._buffers['centroid_feature_weights'] = self.centroid_weights.unsqueeze(1).expand(-1, X_batch.shape[1]).clone()
+                    self.centroid_feature_weights = self.centroid_weights.unsqueeze(1).expand(-1, X_batch.shape[1]).clone()
                     
                 M_sw = feature_mask * sw.unsqueeze(1)
                 W_feat_update = torch.zeros((K, X_batch.shape[1]), dtype=torch.float32, device=self._device).index_add_(0, pull_idx, M_sw)
                 self.centroid_feature_weights[valid] += W_feat_update[valid]
                 
-                ema_lr_feat = W_feat_update[valid] / self.centroid_feature_weights[valid].clamp(min=1e-9)
+                ema_lr_feat_full = torch.zeros((K, X_batch.shape[1]), dtype=torch.float32, device=self._device)
+                ema_lr_feat_full[valid] = W_feat_update[valid] / self.centroid_feature_weights[valid].clamp(min=1e-9)
+                
                 X_feat_sum = torch.zeros((K, X_batch.shape[1]), dtype=torch.float32, device=self._device).index_add_(0, pull_idx, X_batch_f32 * M_sw)
-                self.centroids[valid] = ((1 - ema_lr_feat) * self.centroids[valid].to(torch.float32) + ema_lr_feat * (X_feat_sum[valid] / W_feat_update[valid].clamp(min=1e-9))).to(self._torch_dtype)
+                self.centroids[valid] = ((1 - ema_lr_feat_full[valid]) * self.centroids[valid].to(torch.float32) + ema_lr_feat_full[valid] * (X_feat_sum[valid] / W_feat_update[valid].clamp(min=1e-9))).to(self._torch_dtype)
             
             if self.distance == 'cosine': 
                 self.centroids = F.normalize(self.centroids.to(torch.float32), p=2, dim=1).to(self._torch_dtype)
@@ -795,9 +833,10 @@ class FastKMeansClusterer(BaseFastKMeans):
 class FastKMeansClassifier(BaseFastKMeans):
     """Classifier utilizing Negative Sampling, LVQ Repulsion, and Mask-aware Routing."""
     
-    def __init__(self, k_init: int = 3, repulsion_factor: float = 0.05, **kwargs):
+    def __init__(self, k_init: Union[int, str] = 'auto', repulsion_factor: float = 0.05, **kwargs):
         super().__init__(**kwargs)
-        self.k_init = k_init
+        if isinstance(k_init, str): _check_param('k_init', k_init.lower(), ['auto'])
+        self.k_init = k_init if isinstance(k_init, int) else k_init.lower()
         self.repulsion_factor = repulsion_factor
         self.register_buffer('centroid_labels', torch.empty(0, dtype=torch.long, device=self._device))
         self.classes_ = torch.empty(0, dtype=torch.long, device=self._device)
@@ -811,7 +850,7 @@ class FastKMeansClassifier(BaseFastKMeans):
         for c in self.classes_:
             X_c = X[y == c]
             n_samples = X_c.shape[0]
-            k = min(self.k_init, n_samples)
+            k = self._calculate_optimal_k(X_c, is_target=False) if self.k_init == 'auto' else min(self.k_init, n_samples)
             
             if self.init_mode == 'random':
                 centers = X_c[torch.randperm(n_samples, device=self._device)[:k]]
@@ -863,9 +902,11 @@ class FastKMeansClassifier(BaseFastKMeans):
             X_batch_f32 = X_batch.to(torch.float32)
 
             if feature_mask is None:
-                ema_lr = W_update[valid] / self.centroid_weights[valid]
+                ema_lr_full = torch.zeros(K, dtype=torch.float32, device=self._device)
+                ema_lr_full[valid] = W_update[valid] / self.centroid_weights[valid]
+                
                 X_pull_sum = torch.zeros((K, X_batch.shape[1]), dtype=torch.float32, device=self._device).index_add_(0, pull_idx, X_batch_f32 * sw.unsqueeze(1))
-                ema_lr_exp = ema_lr.unsqueeze(1)
+                ema_lr_exp = ema_lr_full[valid].unsqueeze(1)
                 self.centroids[valid] = ((1 - ema_lr_exp) * self.centroids[valid].to(torch.float32) + ema_lr_exp * (X_pull_sum[valid] / W_update[valid].unsqueeze(1))).to(self._torch_dtype)
                 
                 if self.repulsion_factor > 0:
@@ -874,18 +915,22 @@ class FastKMeansClassifier(BaseFastKMeans):
                     valid_push = (W_push > 0) & valid 
                     if valid_push.any():
                         X_push_sum = torch.zeros((K, X_batch.shape[1]), dtype=torch.float32, device=self._device).index_add_(0, push_idx, X_batch_f32 * sw.unsqueeze(1))
-                        self.centroids[valid_push] -= (ema_lr[valid_push].unsqueeze(1) * self.repulsion_factor) * (X_push_sum[valid_push] / W_push[valid_push].unsqueeze(1))
+                        ema_lr_push_full = torch.zeros(K, dtype=torch.float32, device=self._device)
+                        ema_lr_push_full[valid_push] = W_push[valid_push] / self.centroid_weights[valid_push].clamp(min=1e-9)
+                        self.centroids[valid_push] -= (ema_lr_push_full[valid_push].unsqueeze(1) * self.repulsion_factor) * (X_push_sum[valid_push] / W_push[valid_push].unsqueeze(1))
             else:
                 if getattr(self, "centroid_feature_weights", None) is None or self.centroid_feature_weights.numel() == 0:
-                    self._buffers['centroid_feature_weights'] = self.centroid_weights.unsqueeze(1).expand(-1, X_batch.shape[1]).clone()
+                    self.centroid_feature_weights = self.centroid_weights.unsqueeze(1).expand(-1, X_batch.shape[1]).clone()
                     
                 M_sw = feature_mask * sw.unsqueeze(1)
                 W_feat_update = torch.zeros((K, X_batch.shape[1]), dtype=torch.float32, device=self._device).index_add_(0, pull_idx, M_sw)
                 self.centroid_feature_weights[valid] += W_feat_update[valid]
                 
-                ema_lr_feat = W_feat_update[valid] / self.centroid_feature_weights[valid].clamp(min=1e-9)
+                ema_lr_feat_full = torch.zeros((K, X_batch.shape[1]), dtype=torch.float32, device=self._device)
+                ema_lr_feat_full[valid] = W_feat_update[valid] / self.centroid_feature_weights[valid].clamp(min=1e-9)
+                
                 X_feat_sum = torch.zeros((K, X_batch.shape[1]), dtype=torch.float32, device=self._device).index_add_(0, pull_idx, X_batch_f32 * M_sw)
-                self.centroids[valid] = ((1 - ema_lr_feat) * self.centroids[valid].to(torch.float32) + ema_lr_feat * (X_feat_sum[valid] / W_feat_update[valid].clamp(min=1e-9))).to(self._torch_dtype)
+                self.centroids[valid] = ((1 - ema_lr_feat_full[valid]) * self.centroids[valid].to(torch.float32) + ema_lr_feat_full[valid] * (X_feat_sum[valid] / W_feat_update[valid].clamp(min=1e-9))).to(self._torch_dtype)
                 
                 if self.repulsion_factor > 0:
                     push_idx = torch.argmax(torch.where(~mask_same, sim, torch.tensor(-float('inf'), device=self._device)), dim=1)
@@ -893,8 +938,9 @@ class FastKMeansClassifier(BaseFastKMeans):
                     valid_push = (W_feat_push > 0).any(dim=1) & valid
                     if valid_push.any():
                         X_feat_push_sum = torch.zeros((K, X_batch.shape[1]), dtype=torch.float32, device=self._device).index_add_(0, push_idx, X_batch_f32 * M_sw)
-                        ema_lr_feat_push = W_feat_push[valid_push] / self.centroid_feature_weights[valid_push].clamp(min=1e-9)
-                        self.centroids[valid_push] -= (ema_lr_feat_push * self.repulsion_factor) * (X_feat_push_sum[valid_push] / W_feat_push[valid_push].clamp(min=1e-9))
+                        ema_lr_feat_push_full = torch.zeros((K, X_batch.shape[1]), dtype=torch.float32, device=self._device)
+                        ema_lr_feat_push_full[valid_push] = W_feat_push[valid_push] / self.centroid_feature_weights[valid_push].clamp(min=1e-9)
+                        self.centroids[valid_push] -= (ema_lr_feat_push_full[valid_push] * self.repulsion_factor) * (X_feat_push_sum[valid_push] / W_feat_push[valid_push].clamp(min=1e-9))
 
             if self.distance == 'cosine': 
                 self.centroids = F.normalize(self.centroids.to(torch.float32), p=2, dim=1).to(self._torch_dtype)
@@ -957,11 +1003,12 @@ class FastKMeansClassifier(BaseFastKMeans):
 class FastMultiLabelKMeansClassifier(BaseFastKMeans):
     """Multi-Label Classifier featuring Independent Tag Sub-topologies and Configurable ASL."""
     
-    def __init__(self, k_init: int = 3, repulsion_factor: float = 0.0, 
+    def __init__(self, k_init: Union[int, str] = 'auto', repulsion_factor: float = 0.0, 
                  asl_gamma_neg: float = 4.0, asl_gamma_pos: float = 1.0, 
                  asl_clip: float = 0.05, asl_eps: float = 1e-8, **kwargs):
         super().__init__(**kwargs)
-        self.k_init = k_init
+        if isinstance(k_init, str): _check_param('k_init', k_init.lower(), ['auto'])
+        self.k_init = k_init if isinstance(k_init, int) else k_init.lower()
         self.repulsion_factor = repulsion_factor
         self.asl_gamma_neg = asl_gamma_neg
         self.asl_gamma_pos = asl_gamma_pos
@@ -981,7 +1028,7 @@ class FastMultiLabelKMeansClassifier(BaseFastKMeans):
             X_c = X[torch.where(Y[:, c] > 0)[0]]
             if len(X_c) == 0: continue
             
-            k = min(self.k_init, X_c.shape[0])
+            k = self._calculate_optimal_k(X_c, is_target=False) if self.k_init == 'auto' else min(self.k_init, X_c.shape[0])
             if self.init_mode == 'random':
                 centers = X_c[torch.randperm(X_c.shape[0], device=self._device)[:k]]
             else:
@@ -1003,7 +1050,6 @@ class FastMultiLabelKMeansClassifier(BaseFastKMeans):
 
     def forward(self, X: torch.Tensor, feature_mask: Optional[torch.Tensor] = None) -> torch.Tensor:
         sim, _ = self._cdist_topk(X, self.top_k, feature_mask)
-        
         if self.distance == 'cosine': 
             sim = (sim + 1.0) / 2.0 
             
@@ -1051,20 +1097,23 @@ class FastMultiLabelKMeansClassifier(BaseFastKMeans):
 
                 valid = (W_update > 0) & (~self.frozen_mask if self.frozen_mask is not None else True)
                 self.centroid_weights[valid] += W_update[valid]
-                ema_lr = W_update[valid] / self.centroid_weights[valid]
+                
+                ema_lr_full = torch.zeros(K, dtype=torch.float32, device=self._device)
+                ema_lr_full[valid] = W_update[valid] / self.centroid_weights[valid]
                 
                 old_centroids = self.centroids.clone()
-                self.centroids[valid] = ((1 - ema_lr.unsqueeze(1)) * self.centroids[valid].to(torch.float32) + ema_lr.unsqueeze(1) * (X_sum[valid] / W_update[valid].unsqueeze(1))).to(self._torch_dtype)
+                self.centroids[valid] = ((1 - ema_lr_full[valid].unsqueeze(1)) * self.centroids[valid].to(torch.float32) + ema_lr_full[valid].unsqueeze(1) * (X_sum[valid] / W_update[valid].unsqueeze(1))).to(self._torch_dtype)
                 
                 if self.repulsion_factor > 0:
                     valid_push = (W_push > 0) & (~self.frozen_mask if self.frozen_mask is not None else True)
                     if valid_push.any():
-                        ema_lr_push = W_push[valid_push] / self.centroid_weights[valid_push].clamp(min=1e-9)
-                        self.centroids[valid_push] -= (ema_lr_push.unsqueeze(1) * self.repulsion_factor) * (X_push_sum[valid_push] / W_push[valid_push].unsqueeze(1))
+                        ema_lr_push_full = torch.zeros(K, dtype=torch.float32, device=self._device)
+                        ema_lr_push_full[valid_push] = W_push[valid_push] / self.centroid_weights[valid_push].clamp(min=1e-9)
+                        self.centroids[valid_push] -= (ema_lr_push_full[valid_push].unsqueeze(1) * self.repulsion_factor) * (X_push_sum[valid_push] / W_push[valid_push].unsqueeze(1))
                         
             else:
                 if getattr(self, "centroid_feature_weights", None) is None or self.centroid_feature_weights.numel() == 0:
-                    self._buffers['centroid_feature_weights'] = self.centroid_weights.unsqueeze(1).expand(-1, X_batch.shape[1]).clone()
+                    self.centroid_feature_weights = self.centroid_weights.unsqueeze(1).expand(-1, X_batch.shape[1]).clone()
                     
                 M_sw = feature_mask * sw.unsqueeze(1)
                 W_feat_update = torch.zeros((K, X_batch.shape[1]), dtype=torch.float32, device=self._device)
@@ -1096,16 +1145,19 @@ class FastMultiLabelKMeansClassifier(BaseFastKMeans):
 
                 valid = (W_feat_update > 0).any(dim=1) & (~self.frozen_mask if self.frozen_mask is not None else True)
                 self.centroid_feature_weights[valid] += W_feat_update[valid]
-                ema_lr_feat = W_feat_update[valid] / self.centroid_feature_weights[valid].clamp(min=1e-9)
+                
+                ema_lr_feat_full = torch.zeros((K, X_batch.shape[1]), dtype=torch.float32, device=self._device)
+                ema_lr_feat_full[valid] = W_feat_update[valid] / self.centroid_feature_weights[valid].clamp(min=1e-9)
                 
                 old_centroids = self.centroids.clone()
-                self.centroids[valid] = ((1 - ema_lr_feat) * self.centroids[valid].to(torch.float32) + ema_lr_feat * (X_feat_sum[valid] / W_feat_update[valid].clamp(min=1e-9))).to(self._torch_dtype)
+                self.centroids[valid] = ((1 - ema_lr_feat_full[valid]) * self.centroids[valid].to(torch.float32) + ema_lr_feat_full[valid] * (X_feat_sum[valid] / W_feat_update[valid].clamp(min=1e-9))).to(self._torch_dtype)
                 
                 if self.repulsion_factor > 0:
                     valid_push = (W_feat_push > 0).any(dim=1) & (~self.frozen_mask if self.frozen_mask is not None else True)
                     if valid_push.any():
-                        ema_lr_push_feat = W_feat_push[valid_push] / self.centroid_feature_weights[valid_push].clamp(min=1e-9)
-                        self.centroids[valid_push] -= (ema_lr_push_feat * self.repulsion_factor) * (X_feat_push[valid_push] / W_feat_push[valid_push].clamp(min=1e-9))
+                        ema_lr_feat_push_full = torch.zeros((K, X_batch.shape[1]), dtype=torch.float32, device=self._device)
+                        ema_lr_feat_push_full[valid_push] = W_feat_push[valid_push] / self.centroid_feature_weights[valid_push].clamp(min=1e-9)
+                        self.centroids[valid_push] -= (ema_lr_feat_push_full[valid_push] * self.repulsion_factor) * (X_feat_push[valid_push] / W_feat_push[valid_push].clamp(min=1e-9))
             
             if self.distance == 'cosine': 
                 self.centroids = F.normalize(self.centroids.to(torch.float32), p=2, dim=1).to(self._torch_dtype)
@@ -1167,16 +1219,19 @@ class FastMultiLabelKMeansClassifier(BaseFastKMeans):
 class FastKMeansRegressor(BaseFastKMeans):
     """Memory-efficient Regressor mapping arbitrary input features to Vector targets."""
     
-    def __init__(self, k_targets: int = 20, k_features: int = 10, target_distance: str = 'euclidean', target_assignment: str = 'scaled', **kwargs):
+    def __init__(self, k_targets: Union[int, str] = 'auto', k_features: Union[int, str] = 'auto', target_distance: str = 'euclidean', target_assignment: str = 'scaled', **kwargs):
         super().__init__(**kwargs)
+        if isinstance(k_targets, str): _check_param('k_targets', k_targets.lower(), ['auto'])
+        if isinstance(k_features, str): _check_param('k_features', k_features.lower(), ['auto'])
+        self.k_targets = k_targets if isinstance(k_targets, int) else k_targets.lower()
+        self.k_features = k_features if isinstance(k_features, int) else k_features.lower()
+        
         target_distance = target_distance.lower() if isinstance(target_distance, str) else target_distance
         target_assignment = target_assignment.lower() if isinstance(target_assignment, str) else target_assignment
         
         _check_param('target_distance', target_distance, ['euclidean', 'cosine'])
         _check_param('target_assignment', target_assignment, ['hard', 'mean', 'scaled', 'softmax_scaled'])
         
-        self.k_targets = k_targets
-        self.k_features = k_features
         self.target_distance = target_distance
         self.target_assignment = target_assignment
         
@@ -1192,7 +1247,7 @@ class FastKMeansRegressor(BaseFastKMeans):
     def _initialize(self, X: torch.Tensor, y: torch.Tensor) -> None:
         """Executes 2-Stage Target-Feature Stratification."""
         n_samples = X.shape[0]
-        k_t_actual = min(self.k_targets, n_samples)
+        k_t_actual = self._calculate_optimal_k(y, is_target=True) if self.k_targets == 'auto' else min(self.k_targets, n_samples)
         
         if self.init_mode == 'random':
             y_c = y[torch.randperm(n_samples, device=self._device)[:k_t_actual]]
@@ -1222,9 +1277,8 @@ class FastKMeansRegressor(BaseFastKMeans):
             if not mask.any(): continue
             
             X_sub, y_sub = X[mask], y[mask]
-            k_f_actual = min(self.k_features, X_sub.shape[0])
+            k_f_actual = self._calculate_optimal_k(X_sub, is_target=False) if self.k_features == 'auto' else min(self.k_features, X_sub.shape[0])
             
-            # The FIRST centroid is mathematically forced to be the stratum's global mean
             centers_x = X_sub.mean(dim=0, keepdim=True)
             centers_y = y_sub.mean(dim=0, keepdim=True)
             
@@ -1274,25 +1328,32 @@ class FastKMeansRegressor(BaseFastKMeans):
             X_batch_f32 = X_batch.to(torch.float32)
             
             if feature_mask is None:
-                ema_lr = W_update[valid] / self.centroid_weights[valid]
+                ema_lr_full = torch.zeros(K, dtype=torch.float32, device=self._device)
+                ema_lr_full[valid] = W_update[valid] / self.centroid_weights[valid]
+                
                 X_sum = torch.zeros((K, X_batch.shape[1]), dtype=torch.float32, device=self._device).index_add_(0, pull_idx, X_batch_f32 * sw.unsqueeze(1))
-                ema_lr_exp = ema_lr.unsqueeze(1)
+                ema_lr_exp = ema_lr_full[valid].unsqueeze(1)
                 self.centroids[valid] = ((1 - ema_lr_exp) * self.centroids[valid].to(torch.float32) + ema_lr_exp * (X_sum[valid] / W_update[valid].unsqueeze(1))).to(self._torch_dtype)
             else:
                 if getattr(self, "centroid_feature_weights", None) is None or self.centroid_feature_weights.numel() == 0:
-                    self._buffers['centroid_feature_weights'] = self.centroid_weights.unsqueeze(1).expand(-1, X_batch.shape[1]).clone()
+                    self.centroid_feature_weights = self.centroid_weights.unsqueeze(1).expand(-1, X_batch.shape[1]).clone()
                     
                 M_sw = feature_mask * sw.unsqueeze(1)
                 W_feat_update = torch.zeros((K, X_batch.shape[1]), dtype=torch.float32, device=self._device).index_add_(0, pull_idx, M_sw)
                 self.centroid_feature_weights[valid] += W_feat_update[valid]
                 
-                ema_lr_feat = W_feat_update[valid] / self.centroid_feature_weights[valid].clamp(min=1e-9)
+                ema_lr_feat_full = torch.zeros((K, X_batch.shape[1]), dtype=torch.float32, device=self._device)
+                ema_lr_feat_full[valid] = W_feat_update[valid] / self.centroid_feature_weights[valid].clamp(min=1e-9)
+                
                 X_feat_sum = torch.zeros((K, X_batch.shape[1]), dtype=torch.float32, device=self._device).index_add_(0, pull_idx, X_batch_f32 * M_sw)
-                self.centroids[valid] = ((1 - ema_lr_feat) * self.centroids[valid].to(torch.float32) + ema_lr_feat * (X_feat_sum[valid] / W_feat_update[valid].clamp(min=1e-9))).to(self._torch_dtype)
+                self.centroids[valid] = ((1 - ema_lr_feat_full[valid]) * self.centroids[valid].to(torch.float32) + ema_lr_feat_full[valid] * (X_feat_sum[valid] / W_feat_update[valid].clamp(min=1e-9))).to(self._torch_dtype)
 
             Y_f32 = y_batch.to(torch.float32)
-            ema_lr_targ = W_update[valid] / self.centroid_weights[valid]
-            ema_lr_targ_exp = ema_lr_targ.unsqueeze(1)
+            
+            # Using the pre-calculated global full-sized array for safety
+            ema_lr_targ_full = torch.zeros(K, dtype=torch.float32, device=self._device)
+            ema_lr_targ_full[valid] = W_update[valid] / self.centroid_weights[valid]
+            ema_lr_targ_exp = ema_lr_targ_full[valid].unsqueeze(1)
             
             if self.target_assignment == 'hard':
                 batch_target = Y_f32[torch.argmax(sim, dim=0)][valid]
@@ -1308,6 +1369,7 @@ class FastKMeansRegressor(BaseFastKMeans):
                 
                 weighted_P_sim = P_sim * sw
                 Y_sum = torch.zeros((K, Y_f32.shape[1]), dtype=torch.float32, device=self._device).index_add_(0, pull_idx, Y_f32 * weighted_P_sim.unsqueeze(1))
+                
                 Sim_sum = torch.zeros(K, dtype=torch.float32, device=self._device).index_add_(0, pull_idx, weighted_P_sim)
                 batch_target = Y_sum[valid] / (Sim_sum[valid].unsqueeze(1) + 1e-9)
 
@@ -1321,7 +1383,6 @@ class FastKMeansRegressor(BaseFastKMeans):
     def _grad_step(self, X_batch: torch.Tensor, y_batch: torch.Tensor, sample_weight: torch.Tensor, feature_mask: Optional[torch.Tensor], loss_fn: Callable, optimizer: optim.Optimizer) -> float:
         optimizer.zero_grad()
         loss = loss_fn(self.forward(X_batch, feature_mask).to(torch.float32), y_batch.to(torch.float32))
-        
         loss = (loss.mean(dim=1) * sample_weight.flatten()).mean()
         loss = loss + self._get_regularization_loss()
         loss.backward()
